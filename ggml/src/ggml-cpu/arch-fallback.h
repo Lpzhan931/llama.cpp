@@ -9,6 +9,7 @@
 #define quantize_row_q8_1_generic quantize_row_q8_1
 #define quantize_row_q8_K_generic quantize_row_q8_K
 #define ggml_vec_dot_q4_0_q8_0_generic ggml_vec_dot_q4_0_q8_0
+#define ggml_vec_dot_q4_0_64_q8_0_generic ggml_vec_dot_q4_0_64_q8_0     // NOTE
 #define ggml_vec_dot_q4_1_q8_1_generic ggml_vec_dot_q4_1_q8_1
 #define ggml_vec_dot_q5_0_q8_0_generic ggml_vec_dot_q5_0_q8_0
 #define ggml_vec_dot_q5_1_q8_1_generic ggml_vec_dot_q5_1_q8_1
@@ -63,6 +64,7 @@
 #define ggml_gemv_q2_K_8x8_q8_K_generic ggml_gemv_q2_K_8x8_q8_K
 #define ggml_gemm_iq4_nl_8x8_q8_0_generic ggml_gemm_iq4_nl_8x8_q8_0
 #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
+#define ggml_vec_dot_q4_0_64_q8_0_generic ggml_vec_dot_q4_0_64_q8_0     // NOTE
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4

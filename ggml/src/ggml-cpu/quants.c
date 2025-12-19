@@ -26,6 +26,10 @@ void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q4_0_ref(x, y, k);
 }
 
+void quantize_row_q4_0_64(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_0_64_ref(x, y, k);
+}
+
 void quantize_row_q4_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_1_ref(x, y, k);
 }
@@ -143,6 +147,53 @@ void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
         int sumi = sumi0 + sumi1;
         sumf += sumi*GGML_CPU_FP16_TO_FP32(x[ib].d)*GGML_CPU_FP16_TO_FP32(y[ib].d);
+    }
+
+    *s = sumf;
+}
+
+// NOTE
+void ggml_vec_dot_q4_0_64_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK4_0_64;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q4_0_64 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy; // Q8_0 block size is 32
+
+    float sumf = 0;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d);
+        
+        int sumi = 0;
+        
+        // Q4_0_64 block (64 elements) corresponds to TWO Q8_0 blocks (32 elements each)
+        // x[i] 对应 y[2*i] 和 y[2*i+1]
+        
+        // Process first 32 elements (lower nibbles of x[i])
+        const block_q8_0 * y0 = &y[2*i];
+        const float dy0 = GGML_CPU_FP16_TO_FP32(y0->d);
+        
+        for (int j = 0; j < 32; ++j) {
+            const int v0 = (x[i].qs[j] & 0x0F) - 8;
+            sumf += (v0 * y0->qs[j]) * d * dy0;
+        }
+
+        // Process next 32 elements (higher nibbles of x[i])
+        const block_q8_0 * y1 = &y[2*i+1];
+        const float dy1 = GGML_CPU_FP16_TO_FP32(y1->d);
+        
+        for (int j = 0; j < 32; ++j) {
+            const int v1 = (x[i].qs[j] >> 4) - 8;
+            sumf += (v1 * y1->qs[j]) * d * dy1;
+        }
     }
 
     *s = sumf;

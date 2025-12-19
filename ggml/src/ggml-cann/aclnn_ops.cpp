@@ -1987,6 +1987,46 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
     }
 }
 
+// 修改打印函数，增加 Device 到 Host 的拷贝逻辑
+static void debug_print_hex(const char * label, void * dev_ptr, size_t size_to_print) {
+    if (dev_ptr == nullptr) {
+        printf("[DEBUG] %s: Pointer is NULL\n", label);
+        return;
+    }
+
+    // 1. 在栈上分配一个临时 Host buffer
+    // 注意：不要打印太大，以免栈溢出。这里限制最大 256 字节。
+    size_t safe_size = size_to_print > 8192 ? 8192 : size_to_print;
+    uint8_t host_buf[8192];
+
+    // 2. 将数据从 Device (NPU) 拷贝到 Host (CPU)
+    // ACL_MEMCPY_DEVICE_TO_HOST = 2
+    aclError ret = aclrtMemcpy(host_buf, safe_size, dev_ptr, safe_size, ACL_MEMCPY_DEVICE_TO_HOST);
+    
+    if (ret != ACL_SUCCESS) {
+        // 如果拷贝失败，说明可能不是 Device 指针，或者指针非法
+        // 尝试作为 Host 指针直接读取（以防万一它其实在 CPU 上）
+        printf("[DEBUG] %s (ptr: %p): aclrtMemcpy failed (err %d), trying direct access...\n", label, dev_ptr, ret);
+        // 注意：如果这里依然崩溃，说明指针彻底无效
+        uint8_t* p = (uint8_t*)dev_ptr;
+        printf("[DEBUG] %s (Host Fallback): ", label);
+        for (size_t i = 0; i < safe_size; ++i) {
+            printf("%02X ", p[i]);
+        }
+        printf("\n");
+        return;
+    }
+
+    // 3. 打印 Host buffer 中的数据
+    printf("\n[DEBUG] %s (Device ptr: %p, first %zu bytes): \n", label, dev_ptr, safe_size);
+    for (size_t i = 0; i < safe_size; ++i) {
+        printf("%02X ", host_buf[i]);
+        if ((i + 1) % 64 == 0) printf("\n");
+    }
+    if (safe_size % 64 != 0) printf("\n");
+    printf("===========================================\n\n");
+}
+
 /**
  * @brief Performs matrix multiplication with quantized weights and
  * floating-point inputs using the CANN backend.
@@ -2011,19 +2051,35 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     float weight_elem_size;
     if (type == GGML_TYPE_Q4_0) {
         weight_elem_size = float(sizeof(uint8_t)) / 2;
+    } else if (type == GGML_TYPE_Q4_0_64) {
+        weight_elem_size = float(sizeof(uint8_t)) / 2;
     } else if (type == GGML_TYPE_Q8_0) {
         weight_elem_size = float(sizeof(uint8_t));
     } else {
-        GGML_ABORT("Only support Q4_0 and Q8_0 MUL_MAT");
+        // GGML_ABORT("Only support Q4_0 and Q8_0 MUL_MAT");
+        GGML_ABORT("Only support Q4_0, Q4_0_64 and Q8_0 MUL_MAT");
     }
     float  weight_nb[]   = { src0->ne[0] * weight_elem_size, weight_elem_size };
+    if (type == GGML_TYPE_Q4_0_64) {        // NOTE: Q4_0_64 在从 ggml 排列转成 CANN 排列的时候被从行主序改为了列主序，所以这里 _nb 单独考虑
+        weight_nb[0] = weight_elem_size;    // weight_nb[] = { weight_elem_size, src0->ne[1] * weight_elem_size };
+        weight_nb[1] = src0->ne[1] * weight_elem_size;
+    }
+    
     size_t weight_stride = src0->ne[1] * src0->ne[0] * weight_elem_size;
     size_t weight_size   = weight_stride * src0->ne[2] * src0->ne[3];
 
     // scale stored at the end of weight. Also need transpose.
     size_t scale_elem_size = sizeof(uint16_t);
-    size_t scale_nb[]      = { src0->ne[0] / QK8_0 * scale_elem_size, scale_elem_size };
-    size_t scale_stride    = src0->ne[1] * src0->ne[0] / QK8_0 * scale_elem_size;
+    // size_t scale_nb[]      = { src0->ne[0] / QK8_0 * scale_elem_size, scale_elem_size };
+    // size_t scale_stride    = src0->ne[1] * src0->ne[0] / QK8_0 * scale_elem_size;
+    // char * scale_offset    = (char *) src0->data + weight_size;
+    const int group_size = (type == GGML_TYPE_Q4_0_64) ? QK4_0_64 : QK8_0;
+    size_t scale_nb[]      = { src0->ne[0] / group_size * scale_elem_size, scale_elem_size };
+    if (type == GGML_TYPE_Q4_0_64) {        // NOTE: Q4_0_64 设为列主序，单独处理
+        scale_nb[0] = scale_elem_size;      // scale_nb[] = { scale_elem_size, src0->ne[1] * scale_elem_size };
+        scale_nb[1] = src0->ne[1] * scale_elem_size;
+    }
+    size_t scale_stride    = src0->ne[1] * src0->ne[0] / group_size * scale_elem_size;
     char * scale_offset    = (char *) src0->data + weight_size;
 
     // input
@@ -2033,6 +2089,16 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     size_t               input_stride    = input_ne[0] * input_ne[1] * input_elem_size;
     ggml_cann_pool_alloc input_alloctor(ctx.pool());
     void *               input_buffer = src1->data;
+
+    // NOTE
+    // printf("\n[DEBUG] src0_ne[%ld, %ld]\t", src0->ne[0], src0->ne[1]);
+    // printf("src0_nb[%ld, %ld]\t", src0->nb[0], src0->nb[1]);
+    // printf("src1_ne[%ld, %ld]\t", src1->ne[0], src1->ne[1]);
+    // printf("src1_nb[%ld, %ld]\t", src1->nb[0], src1->nb[1]);
+
+    // printf("\n[DEBUG] input ne[%ld, %ld] ", input_ne[0], input_ne[1]);
+    // printf(" nb[%ld, %ld]\t", input_nb[0], input_nb[1]);
+
 
     // case in
     if (src1->type != GGML_TYPE_F16) {
@@ -2077,9 +2143,25 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
             int64_t weight_ne_offset = 0;
             int64_t weight_ne[2]     = { max_elem_size > src0->ne[1] ? src0->ne[1] : max_elem_size, src0->ne[0] };
             int64_t scale_ne_offset  = 0;
-            int64_t scale_ne[2]      = { weight_ne[0], weight_ne[1] / QK8_0 };
+            // int64_t scale_ne[2]      = { weight_ne[0], weight_ne[1] / QK8_0 };
+            int64_t scale_ne[2]      = { weight_ne[0], weight_ne[1] / group_size };
             int64_t output_ne_offset = 0;
             int64_t output_ne[2]     = { weight_ne[0], dst->ne[1] };
+
+            // NOTE
+            // printf("weight ne[%ld, %ld] ", weight_ne[0], weight_ne[1]);
+            // printf("nb[%f, %f]\t", weight_nb[0], weight_nb[1]);
+            // printf("scale ne[%ld, %ld] ", scale_ne[0], scale_ne[1]);
+            // printf("nb[%ld, %ld]\t", scale_nb[0], scale_nb[1]);
+            // printf("output ne[%ld, %ld] ", output_ne[0], output_ne[1]);
+            // printf("nb[%ld, %ld]\t", output_nb[0], output_nb[1]);
+
+            // // 打印内存
+            // char * cur_weight_ptr = (char *) src0->data + batch0 * weight_stride;
+            // char * cur_scale_ptr  = scale_offset + batch0 * scale_stride;
+            // debug_print_hex("Weight Raw", cur_weight_ptr, 8192);
+            // debug_print_hex("Scale Raw ", cur_scale_ptr, 8192);
+
 
             acl_tensor_ptr acl_weight_tensor =
                 ggml_cann_create_tensor((char *) src0->data + batch0 * weight_stride, ggml_cann_type_mapping(type),
@@ -2091,12 +2173,23 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
                 ggml_cann_create_tensor((char *) output_buffer + batch1 * output_stride, ACL_FLOAT16, output_elem_size,
                                         output_ne, output_nb, 2, ACL_FORMAT_ND, output_ne_offset);
             int64_t antiquantGroupSize = 0;
-            if (src0->ne[0] > QK8_0) {
-                antiquantGroupSize = QK8_0;
+            // if (src0->ne[0] > QK8_0) {
+            //     antiquantGroupSize = QK8_0;
+            // }
+            if (src0->ne[0] > group_size) {
+                antiquantGroupSize = group_size;
             }
             GGML_CANN_CALL_ACLNN_OP(ctx, WeightQuantBatchMatmulV2, acl_input_tensor.get(), acl_weight_tensor.get(),
                                     acl_scale_tensor.get(), nullptr, nullptr, nullptr, nullptr, antiquantGroupSize,
                                     acl_output_tensor.get());
+
+            
+            // // 确保 NPU 上的计算流已完成，保证数据已完全写入显存
+            // aclrtSynchronizeStream(ctx.stream());
+            // // 打印输出 Buffer (Device Memory)，此时 output_buffer 里的数据类型通常是 F16 (half precision)
+            // char *cur_output_buffer = (char *) output_buffer + batch1 * output_stride;
+            // debug_print_hex("MatMul Result (F16)", cur_output_buffer, 8192);
+            // exit(0);
 
             // other splits
             for (int64_t split = 1; split < split_size; split++) {
@@ -2107,6 +2200,7 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
                 scale_ne[0] = weight_ne[0];
                 output_ne_offset += output_elem_size * output_ne[0] * output_ne[1];
                 output_ne[0] = weight_ne[0];
+                scale_ne[1] = weight_ne[1] / group_size;
 
                 acl_weight_tensor =
                     ggml_cann_create_tensor((char *) src0->data + batch0 * weight_stride, ggml_cann_type_mapping(type),
@@ -2148,6 +2242,7 @@ void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             ggml_cann_mat_mul_fp(ctx, dst);
             break;
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_64:
         case GGML_TYPE_Q8_0:
             ggml_cann_mul_mat_quant(ctx, dst, type);
             break;
@@ -3334,10 +3429,13 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
     float                weight_elem_size;
     if (type == GGML_TYPE_Q4_0) {
         weight_elem_size = float(sizeof(uint8_t)) / 2;
+    } else if (type == GGML_TYPE_Q4_0_64) {
+        weight_elem_size = float(sizeof(uint8_t)) / 2;
     } else if (type == GGML_TYPE_Q8_0) {
         weight_elem_size = float(sizeof(uint8_t));
     } else {
-        GGML_ABORT("MUL_MAT_ID only support quant type Q4_0 and Q8_0 ");
+        // GGML_ABORT("MUL_MAT_ID only support quant type Q4_0 and Q8_0 ");
+        GGML_ABORT("MUL_MAT_ID only support quant type Q4_0, Q4_0_64 and Q8_0 ");
     }
 
     // src0_row [D, M, 1, 1] weight without permute
@@ -3350,9 +3448,12 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
     size_t weight_stride = ne00 * ne01 * weight_elem_size;
     size_t weight_size   = weight_stride * ne02 * ne03;
 
+    const int group_size = (type == GGML_TYPE_Q4_0_64) ? QK4_0_64 : QK8_0;
+
     // scale [D, M, 1, 1] -> scale && permute
     size_t scale_elem_size = sizeof(uint16_t);
-    size_t scale_stride    = src0->ne[1] * src0->ne[0] / QK8_0 * scale_elem_size;
+    // size_t scale_stride    = src0->ne[1] * src0->ne[0] / QK8_0 * scale_elem_size;
+    size_t scale_stride    = src0->ne[1] * src0->ne[0] / group_size * scale_elem_size;
 
     // src1_row [D, 1, 1, 1] -> input
     src1_row.ne[1] = 1;
@@ -3416,6 +3517,7 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             ggml_cann_mul_mat_id_fp(ctx, dst);
             break;
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_64:
         case GGML_TYPE_Q8_0:
             ggml_cann_mul_mat_id_quant(ctx, dst);
             break;

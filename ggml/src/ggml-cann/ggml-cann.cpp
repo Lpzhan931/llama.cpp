@@ -942,6 +942,236 @@ static void ggml_backend_cann_transform_back_q4_0(const ggml_tensor * tensor, vo
 }
 
 /**
+ * @brief Transform quantized Q4_0_64 tensor data into a format suitable for CANN processing.
+ * Adapts the logic from Q4_0 for the larger block size (64). NOTE
+ */
+static void ggml_backend_cann_transform_q4_0_64_row_major(ggml_tensor * tensor, const void * src, void * dst) {
+    // printf("tensor->ne[0]: %ld\tne[1]: %ld\tne[2]: %ld\tne[3]: %ld\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+
+    int64_t n_elems     = ggml_nelements(tensor);
+    int64_t groups      = n_elems / QK4_0_64;
+    size_t  quant_bytes = n_elems * sizeof(uint8_t) / 2;
+
+    uint8_t *  quant_offset = (uint8_t *) dst;
+    uint16_t * scale_offset = (uint16_t *) ((char *) dst + quant_bytes);
+
+    for (int i = 0; i < groups; i++) {
+        const block_q4_0_64 * group = (const block_q4_0_64 *) ((const char *) src + i * sizeof(block_q4_0_64));
+        *scale_offset = group->d;
+        scale_offset++;
+
+        // CANN 需要特定的数据重排，并在后面做 XOR 0x88 处理
+        // Q4_0_64 有 32 字节的 qs (64 个 nibbles)
+        
+        // Pass 1: 处理低 4 位 (Low Nibbles)
+        // 循环次数从 QK4_0/2 (16) 增加到 QK4_0_64/2 (32)
+        for (int j = 0; j < QK4_0_64 / 2; j += 2) {
+            (*quant_offset) = (group->qs[j] & 0x0F);
+            (*quant_offset) |= ((group->qs[j + 1] << 4)); // Combine adjacent bytes
+            quant_offset++;
+        }
+
+        // Pass 2: 处理高 4 位 (High Nibbles)
+        for (int j = 0; j < QK4_0_64 / 2; j += 2) {
+            (*quant_offset) = (group->qs[j] >> 4);
+            (*quant_offset) |= (group->qs[j + 1] & 0xF0);
+            quant_offset++;
+        }
+    }
+
+    // put (uint4b_t -8) into int4b_t (Ascend specific offset)
+    for (quant_offset = (uint8_t *) dst; quant_offset < (uint8_t *) dst + quant_bytes; quant_offset++) {
+        (*quant_offset) ^= 0x88;
+    }
+}
+
+/**
+ * @brief Transform CANN processed data back into quantized Q4_0_64 format.
+ * NOTE
+ */
+static void ggml_backend_cann_transform_back_q4_0_64_row_major(const ggml_tensor * tensor, void * src, void * dst) {
+    int64_t n_elems     = ggml_nelements(tensor);
+    int64_t groups      = n_elems / QK4_0_64;
+    size_t  quant_bytes = n_elems * sizeof(uint8_t) / 2;
+
+    uint8_t *  quant_offset = (uint8_t *) src;
+    uint16_t * scale_offset = (uint16_t *) ((char *) src + quant_bytes);
+
+    // Reverse the 0x88 XOR
+    for (; quant_offset < (uint8_t *) src + quant_bytes; quant_offset++) {
+        (*quant_offset) ^= 0x88;
+    }
+    quant_offset = (uint8_t *) src;
+
+    for (int i = 0; i < groups; i++) {
+        block_q4_0_64 * group = (block_q4_0_64 *) ((char *) dst + i * sizeof(block_q4_0_64));
+        group->d = *scale_offset;
+        scale_offset++;
+
+        // Restore Low Nibbles
+        for (int j = 0; j < QK4_0_64 / 2; j += 2) {
+            group->qs[j]     = ((*quant_offset) & 0x0F);
+            group->qs[j + 1] = ((*quant_offset) >> 4);
+            quant_offset++;
+        }
+
+        // Restore High Nibbles
+        for (int j = 0; j < QK4_0_64 / 2; j += 2) {
+            group->qs[j] |= ((*quant_offset) << 4);
+            group->qs[j + 1] |= ((*quant_offset) & 0xF0);
+            quant_offset++;
+        }
+    }
+}
+
+
+// Weight INT4 转置函数, 原 [Rows, Cols](每 Cols 个相邻) -> 转置后: [Cols, Rows](每 Rows 个相邻)
+void transposeWeightQ4(uint8_t *src, uint8_t *dst, int rows, int cols) {
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            // 1. 读取源数据 (Rows x Cols)
+            // Byte索引 = r * (cols/2) + c/2
+            int srcIdx = r * (cols / 2) + c / 2;
+            uint8_t srcByte = src[srcIdx];
+            // 提取 nibble: 偶数列取低4位，奇数列取高4位
+            uint8_t val = (c % 2 == 0) ? (srcByte & 0x0F) : ((srcByte >> 4) & 0x0F);
+
+            // 2. 写入目标数据 (Cols x Rows)
+            // 现在的“行”是 c，“列”是 r
+            // Byte索引 = c * (rows/2) + r/2
+            int dstIdx = c * (rows / 2) + r / 2;
+            
+            // 写入 nibble: 偶数行(原row)写低4位，奇数行写高4位
+            if (r % 2 == 0) {
+                dst[dstIdx] |= (val & 0x0F); // 存入低位
+            } else {
+                dst[dstIdx] |= (val << 4);   // 存入高位
+            }
+        }
+    }
+}
+
+// Scale FP16 转置函数
+void transposeScaleFP16(uint16_t *src, uint16_t *dst, int rows, int cols) {
+    // std::vector<uint16_t> dst(rows * cols);
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            // dst[c, r] = src[r, c]
+            dst[c * rows + r] = src[r * cols + c];
+        }
+    }
+}
+
+/**
+ * @brief Transform CANN processed data into quantized Q4_0_64 format. (column-major)
+ */
+static void ggml_backend_cann_transform_q4_0_64(ggml_tensor * tensor, const void * src, void * dst) {
+    // printf("tensor->ne[0]: %ld\tne[1]: %ld\tne[2]: %ld\tne[3]: %ld\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+
+    int64_t n_elems     = ggml_nelements(tensor);
+    int64_t groups      = n_elems / QK4_0_64;
+    size_t  quant_bytes = n_elems * sizeof(uint8_t) / 2;
+    size_t  scale_bytes = groups * sizeof(uint16_t);
+
+    // 申请大小为 quant_bytes + scale_bytes 的局部临时缓冲区
+    std::vector<uint8_t> tmp_buffer(quant_bytes + scale_bytes, 0);
+
+    uint8_t *  quant_offset = tmp_buffer.data();
+    uint16_t * scale_offset = (uint16_t *) (tmp_buffer.data() + quant_bytes);
+
+    for (int i = 0; i < groups; i++) {
+        const block_q4_0_64 * group = (const block_q4_0_64 *) ((const char *) src + i * sizeof(block_q4_0_64));
+        *scale_offset = group->d;
+        scale_offset++;
+
+        // CANN 需要特定的数据重排，并在后面做 XOR 0x88 处理
+        // Q4_0_64 有 32 字节的 qs (64 个 nibbles)
+        
+        // Pass 1: 处理低 4 位 (Low Nibbles)
+        // 循环次数从 QK4_0/2 (16) 增加到 QK4_0_64/2 (32)
+        for (int j = 0; j < QK4_0_64 / 2; j += 2) {
+            (*quant_offset) = (group->qs[j] & 0x0F);
+            (*quant_offset) |= ((group->qs[j + 1] << 4)); // Combine adjacent bytes
+            quant_offset++;
+        }
+
+        // Pass 2: 处理高 4 位 (High Nibbles)
+        for (int j = 0; j < QK4_0_64 / 2; j += 2) {
+            (*quant_offset) = (group->qs[j] >> 4);
+            (*quant_offset) |= (group->qs[j + 1] & 0xF0);
+            quant_offset++;
+        }
+    }
+
+    // put (uint4b_t -8) into int4b_t (Ascend specific offset)
+    for (quant_offset = (uint8_t *) tmp_buffer.data(); quant_offset < (uint8_t *) tmp_buffer.data() + quant_bytes; quant_offset++) {
+        (*quant_offset) ^= 0x88;
+    }
+
+    // 从 tmp_buffer 转置后写入 dst
+    memset(dst, 0, quant_bytes);    // 至关重要!!! 清空 dst buffer
+    transposeWeightQ4(tmp_buffer.data(), (uint8_t *)dst, tensor->ne[1], tensor->ne[0]);
+    transposeScaleFP16(
+        (uint16_t *) (tmp_buffer.data() + quant_bytes), 
+        (uint16_t *) ((uint8_t *) dst + quant_bytes), tensor->ne[1], tensor->ne[0] / QK4_0_64
+    );
+    // weight 所需字节数为 quant_bytes, scale 所需字节为 scale_bytes
+    // weight 最终目的地址为 (uint8_t *) dst, scale 最终目的地址为 (uint16_t *) ((char *) dst + quant_bytes)
+    // weight 原版每 K(tensor->ne[0]) 个相邻，重复 N(tensor->ne[1]) 次; 转置后每 N 个相邻，重复 K 次;
+    // scale  原版每 K/QK4_0_64 个相邻，重复 N 次; 转置后每 N 个相邻，重复 K/QK4_0_64 次;
+}
+
+/**
+ * @brief Transform CANN processed data back into quantized Q4_0_64 format. (column-major)
+ */
+static void ggml_backend_cann_transform_back_q4_0_64(const ggml_tensor * tensor, void * src, void * dst) {
+    int64_t n_elems     = ggml_nelements(tensor);
+    int64_t groups      = n_elems / QK4_0_64;
+    size_t  quant_bytes = n_elems * sizeof(uint8_t) / 2;
+    size_t  scale_bytes = groups * sizeof(uint16_t);
+
+    // 申请大小为 quant_bytes + scale_bytes 的局部临时缓冲区
+    std::vector<uint8_t> tmp_buffer(quant_bytes + scale_bytes, 0);
+    // 将 src 中数据转置后写入 tmp_buffer 中
+    transposeWeightQ4((uint8_t *)src, tmp_buffer.data(), tensor->ne[0], tensor->ne[1]); // N 个连续变成 K 个连续
+    transposeScaleFP16(
+        (uint16_t *) ((uint8_t *) src + quant_bytes), 
+        (uint16_t *) (tmp_buffer.data() + quant_bytes), tensor->ne[0] / QK4_0_64, tensor->ne[1]    // N 个连续变成 K/Qk4_0_64 个连续
+    );
+
+    uint8_t *  quant_offset = tmp_buffer.data();
+    uint16_t * scale_offset = (uint16_t *) ((uint8_t *)tmp_buffer.data() + quant_bytes);
+
+    // Reverse the 0x88 XOR
+    for (; quant_offset < tmp_buffer.data() + quant_bytes; quant_offset++) {
+        (*quant_offset) ^= 0x88;
+    }
+    quant_offset = tmp_buffer.data();
+
+    for (int i = 0; i < groups; i++) {
+        block_q4_0_64 * group = (block_q4_0_64 *) ((char *) dst + i * sizeof(block_q4_0_64));
+        group->d = *scale_offset;
+        scale_offset++;
+
+        // Restore Low Nibbles
+        for (int j = 0; j < QK4_0_64 / 2; j += 2) {
+            group->qs[j]     = ((*quant_offset) & 0x0F);
+            group->qs[j + 1] = ((*quant_offset) >> 4);
+            quant_offset++;
+        }
+
+        // Restore High Nibbles
+        for (int j = 0; j < QK4_0_64 / 2; j += 2) {
+            group->qs[j] |= ((*quant_offset) << 4);
+            group->qs[j + 1] |= ((*quant_offset) & 0xF0);
+            quant_offset++;
+        }
+    }
+}
+
+
+
+/**
  * @brief Transform quantized Q8.0 tensor data into a format suitable for CANN
  * processing.
  *
@@ -1020,6 +1250,9 @@ static void ggml_backend_cann_transform(ggml_tensor * tensor, const void * src, 
         case GGML_TYPE_Q4_0:
             ggml_backend_cann_transform_q4_0(tensor, src, dst);
             break;
+        case GGML_TYPE_Q4_0_64:
+            ggml_backend_cann_transform_q4_0_64(tensor, src, dst);
+            break;
         case GGML_TYPE_Q8_0:
             ggml_backend_cann_transform_q8_0(tensor, src, dst);
             break;
@@ -1045,6 +1278,9 @@ static void ggml_backend_cann_transform_back(const ggml_tensor * tensor, void * 
         case GGML_TYPE_Q4_0:
             ggml_backend_cann_transform_back_q4_0(tensor, src, dst);
             break;
+        case GGML_TYPE_Q4_0_64:
+            ggml_backend_cann_transform_back_q4_0_64(tensor, src, dst);
+            break;
         case GGML_TYPE_Q8_0:
             ggml_backend_cann_transform_back_q8_0(tensor, src, dst);
             break;
@@ -1066,6 +1302,7 @@ static bool need_transform(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0_64:
             return true;
         default:
             return false;
@@ -2292,6 +2529,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                         return true;
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_0_64:
 #ifdef ASCEND_310P
                         // Q4 && Q8 per group is not support on 310p device
                         return false;
@@ -2309,6 +2547,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return true;
                 case GGML_TYPE_Q8_0:
                 case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_0_64:
 #ifdef ASCEND_310P
                     // Q4 && Q8 per group is not support on 310p device
                     return false;

@@ -174,6 +174,19 @@ typedef struct {
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
+// NOTE
+#define QK4_0_64 64
+typedef struct {
+    ggml_half d;              // delta (scale), 2 bytes
+    uint8_t qs[QK4_0_64 / 2]; // 64个4bit数 = 32 bytes
+} block_q4_0_64;
+
+// 添加断言确保大小正确 (2 + 32 = 34 bytes)
+// 注意：34 字节不是 16 或 32 的倍数，这在某些 SIMD 加载中可能会有对齐问题，
+// 但对于 CANN 测试或 CPU 基础跑通，packed struct 是可以的。
+static_assert(sizeof(block_q4_0_64) == sizeof(ggml_half) + QK4_0_64 / 2, "wrong q4_0_64 block size/padding");
+
+
 #define QK4_1 32
 typedef struct {
     GGML_EXTENSION union {

@@ -41,6 +41,8 @@ aclDataType ggml_cann_type_mapping(ggml_type type) {
             return ACL_INT32;
         case GGML_TYPE_Q4_0:
             return ACL_INT4;
+        case GGML_TYPE_Q4_0_64:
+            return ACL_INT4;
         case GGML_TYPE_Q8_0:
             return ACL_INT8;
         case GGML_TYPE_I64:
