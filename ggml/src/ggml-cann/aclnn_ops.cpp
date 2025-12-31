@@ -2096,7 +2096,7 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     // printf("src1_ne[%ld, %ld]\t", src1->ne[0], src1->ne[1]);
     // printf("src1_nb[%ld, %ld]\t", src1->nb[0], src1->nb[1]);
 
-    // printf("\n[DEBUG] input ne[%ld, %ld] ", input_ne[0], input_ne[1]);
+    // printf("[DEBUG] input ne[%ld, %ld] ", input_ne[0], input_ne[1]);
     // printf(" nb[%ld, %ld]\t", input_nb[0], input_nb[1]);
 
 
@@ -2154,7 +2154,7 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
             // printf("scale ne[%ld, %ld] ", scale_ne[0], scale_ne[1]);
             // printf("nb[%ld, %ld]\t", scale_nb[0], scale_nb[1]);
             // printf("output ne[%ld, %ld] ", output_ne[0], output_ne[1]);
-            // printf("nb[%ld, %ld]\t", output_nb[0], output_nb[1]);
+            // printf("nb[%ld, %ld]\n", output_nb[0], output_nb[1]);
 
             // // 打印内存
             // char * cur_weight_ptr = (char *) src0->data + batch0 * weight_stride;
