@@ -1,3 +1,0 @@
-[submodule "scripts/validation-datasets-for-llama.cpp"]
-	path = scripts/validation-datasets-for-llama.cpp
-	url = https://huggingface.co/datasets/ikawrakow/validation-datasets-for-llama.cpp.git
